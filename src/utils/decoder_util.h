@@ -28,9 +28,12 @@
 #include "transformer_ctx.h"
 #include "xdnn.h"
 
+#ifdef XFT_GPU
+#include <CL/sycl.hpp>
+#endif
+
 extern int getFlashThresh();
 extern bool enableCATMLP();
-extern bool enableSkipMsk();
 
 class DecoderUtil {
 public:
@@ -444,9 +447,41 @@ public:
         return std::make_pair(maxVal, sum);
     }
 
+#ifdef XFT_GPU
+    template <typename T1, typename T2>
+    static void siluSum(xft::Matrix<T1> &src, xft::Matrix<T2> &dst, void *device = nullptr) {
+        int M = src.Rows();
+        int lds = src.Stride();
+        int N = lds / 2;
+        int ldd = dst.Stride();
+
+        if (device != nullptr) {
+            sycl::queue *gpu_queue = static_cast<sycl::queue *>(device);
+
+            if constexpr (std::is_same_v<T1, float16_t> && std::is_same_v<T2, float16_t>) {
+                sycl::half *src0 = (sycl::half *)src.Data();
+                sycl::half *src1 = (sycl::half *)(src.Data() + N);
+                sycl::half *dest = (sycl::half *)dst.Data();
+
+                gpu_queue
+                        ->submit([&](sycl::handler &h) {
+                            h.parallel_for(M * N, [=](auto i) {
+                                int32_t row = i / N;
+                                int32_t col = i % N;
+                                sycl::half tmp0 = src0[row * lds + col];
+                                sycl::half tmp1 = src1[row * lds + col];
+                                dest[row * ldd + col] = tmp0 * tmp1
+                                        / ((sycl::half)1.0f + (sycl::half)sycl::native::exp(tmp0 * -1.0f));
+                            });
+                        })
+                        .wait();
+            }
+        }
+    }
+#else
     // compute silu on the left half and then add it with the right half
     template <typename T1, typename T2>
-    static void siluSum(xft::Matrix<T1> &src, xft::Matrix<T2> &dst) {
+    static void siluSum(xft::Matrix<T1> &src, xft::Matrix<T2> &dst, void *device = nullptr) {
         __m512 one = _mm512_set1_ps(1.f);
         __m512 negOne = _mm512_set1_ps(-1.f);
         int M = src.Rows();
@@ -469,10 +504,11 @@ public:
             }
         }
     }
+#endif
 
     // compute gelu on the left half and then add it with the right half
     template <typename T1, typename T2>
-    static void geluSum(xft::Matrix<T1> &src, xft::Matrix<T2> &dst) {
+    static void geluSum(xft::Matrix<T1> &src, xft::Matrix<T2> &dst, void *device = nullptr) {
         const __m512 c1 = _mm512_set1_ps(0.044715f);
         const __m512 c2 = _mm512_set1_ps(0.7978845608f);
         const __m512 vone = _mm512_set1_ps(1.0f);
@@ -517,16 +553,31 @@ public:
 
             dnnl_sgemm(ta[0], tb[0], m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 
-        } else if (std::is_same_v<T, bfloat16_t>) {
+        } else {
             CBLAS_TRANSPOSE ta, tb;
             ta = transa ? CblasTrans : CblasNoTrans;
             tb = transb ? CblasTrans : CblasNoTrans;
 
-            cblas_gemm_bf16bf16f32(CblasRowMajor, ta, tb, m, n, k, alpha, (const MKL_BF16 *)(A), lda,
-                    (const MKL_BF16 *)(B), ldb, beta, C, ldc);
-        } else {
-            printf("Datatype Not supported yet\n");
-            exit(-1);
+            if (std::is_same_v<T, bfloat16_t>) {
+                cblas_gemm_bf16bf16f32(CblasRowMajor, ta, tb, m, n, k, alpha, (const MKL_BF16 *)(A), lda,
+                        (const MKL_BF16 *)(B), ldb, beta, C, ldc);
+            } else if (std::is_same_v<T, float16_t>) {
+                static int mkl_enable_inst = -1;
+                if (mkl_enable_inst == -1) {
+#ifdef AMX_FP16_WEIGHT_ONLY_FP16
+                    // AMX FP16
+                    mkl_enable_inst = mkl_enable_instructions(MKL_ENABLE_AVX512_E5);
+#else
+                    // AVX512_FP16, skip E4 avoiding illegal instruction error
+                    mkl_enable_inst = mkl_enable_instructions(MKL_ENABLE_AVX512_E3);
+#endif
+                }
+                cblas_gemm_f16f16f32(CblasRowMajor, ta, tb, m, n, k, alpha, (const MKL_F16 *)(A), lda,
+                        (const MKL_F16 *)(B), ldb, beta, C, ldc);
+            } else {
+                printf("Datatype Not supported yet\n");
+                exit(-1);
+            }
         }
     }
 
@@ -768,14 +819,5 @@ public:
 
         sgemm((T *)AB, C, expABC, m, n, k, k, vStride, n, false, false);
         updateOutTile(output, expABC, preSum, sum, preMax, max, m, n, stride);
-    }
-
-    static bool skipMskAttn(const float *attnMask, int m, int n, int stride) {
-        float lowest = std::numeric_limits<float>::lowest();
-        // left bottom is lowest
-        if (attnMask[(m - 1) * stride] == lowest)
-            return true;
-        else
-            return false;
     }
 };
